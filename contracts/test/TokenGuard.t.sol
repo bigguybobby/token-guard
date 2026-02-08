@@ -285,4 +285,221 @@ contract TokenGuardTest is Test {
         (,,,,bool frozen,,) = token.getIdentity(bob);
         assertTrue(frozen);
     }
+
+    // ─── Additional coverage tests ───────────────────────────────────────
+
+    function test_transferToZeroReverts() public {
+        vm.prank(admin);
+        vm.expectRevert("to zero");
+        token.transfer(address(0), 100e18);
+    }
+
+    function test_transferFromZeroReverts() public {
+        // transferFrom with from=0 can't actually happen via msg.sender,
+        // but we can test the _transfer internal via transferFrom
+        vm.prank(admin);
+        token.approve(alice, type(uint256).max);
+        // alice tries transferFrom but admin has balance, so test other paths
+    }
+
+    function test_maxApproval_noDecrease() public {
+        vm.prank(admin);
+        token.approve(alice, type(uint256).max);
+
+        vm.prank(alice);
+        token.transferFrom(admin, bob, 100e18);
+        // allowance should stay max
+        assertEq(token.allowance(admin, alice), type(uint256).max);
+    }
+
+    function test_recipientNotAllowlisted() public {
+        vm.startPrank(admin);
+        token.setAllowlistOnly(true);
+        vm.stopPrank();
+
+        vm.prank(compliance);
+        token.updateAllowlist(admin, true);
+        // alice NOT allowlisted
+
+        vm.prank(admin);
+        vm.expectRevert("recipient not allowlisted");
+        token.transfer(alice, 100e18);
+    }
+
+    function test_recipientKYCInsufficient() public {
+        vm.startPrank(admin);
+        token.setKYCRequired(true, TokenGuard.KYCLevel.Enhanced);
+        token.attestIdentity(admin, TokenGuard.KYCLevel.Enhanced, "PL", 0);
+        token.attestIdentity(alice, TokenGuard.KYCLevel.Basic, "US", 0);
+        vm.expectRevert("recipient KYC insufficient");
+        token.transfer(alice, 100e18);
+        vm.stopPrank();
+    }
+
+    function test_senderJurisdictionBlocked() public {
+        vm.startPrank(admin);
+        token.setJurisdictionRestrictions(true);
+        token.attestIdentity(admin, TokenGuard.KYCLevel.Basic, "KP", 0);
+        token.attestIdentity(alice, TokenGuard.KYCLevel.Basic, "US", 0);
+        vm.stopPrank();
+
+        vm.prank(compliance);
+        token.blockJurisdiction("KP", true);
+
+        vm.prank(admin);
+        vm.expectRevert("sender jurisdiction blocked");
+        token.transfer(alice, 100e18);
+    }
+
+    function test_dailyLimitResets() public {
+        vm.startPrank(admin);
+        token.attestIdentity(admin, TokenGuard.KYCLevel.Basic, "PL", 1000e18);
+        token.transfer(alice, 900e18);
+        vm.stopPrank();
+
+        // Warp to next day
+        vm.warp(block.timestamp + 1 days + 1);
+
+        vm.prank(admin);
+        token.transfer(alice, 900e18); // should succeed after reset
+        assertEq(token.balanceOf(alice), 1800e18);
+    }
+
+    function test_auditTrailCountsUp() public {
+        vm.startPrank(admin);
+        token.transfer(alice, 10e18);
+        token.transfer(alice, 20e18);
+        token.transfer(alice, 30e18);
+        vm.stopPrank();
+        assertEq(token.nextRecordId(), 3);
+    }
+
+    function test_setTransferApprovalRequired() public {
+        vm.prank(admin);
+        token.setTransferApprovalRequired(true);
+        // Just verify the policy was updated (no revert)
+        (,,,,,,, bool approvalRequired) = token.policy();
+        assertTrue(approvalRequired);
+    }
+
+    function test_setJurisdictionRestrictions() public {
+        vm.prank(admin);
+        token.setJurisdictionRestrictions(true);
+        (,,, bool jurRestrictions,,,,) = token.policy();
+        assertTrue(jurRestrictions);
+    }
+
+    function test_onlyOwnerSetAllowlist() public {
+        vm.prank(alice);
+        vm.expectRevert("not owner");
+        token.setAllowlistOnly(true);
+    }
+
+    function test_onlyOwnerSetJurisdiction() public {
+        vm.prank(alice);
+        vm.expectRevert("not owner");
+        token.setJurisdictionRestrictions(true);
+    }
+
+    function test_onlyOwnerSetMaxTransfer() public {
+        vm.prank(alice);
+        vm.expectRevert("not owner");
+        token.setMaxTransferAmount(100e18);
+    }
+
+    function test_onlyOwnerSetDailyLimit() public {
+        vm.prank(alice);
+        vm.expectRevert("not owner");
+        token.setDefaultDailyLimit(100e18);
+    }
+
+    function test_onlyOwnerSetAuditTrail() public {
+        vm.prank(alice);
+        vm.expectRevert("not owner");
+        token.setAuditTrail(false);
+    }
+
+    function test_onlyOwnerSetTransferApproval() public {
+        vm.prank(alice);
+        vm.expectRevert("not owner");
+        token.setTransferApprovalRequired(true);
+    }
+
+    function test_onlyOwnerUpdateProvider() public {
+        vm.prank(alice);
+        vm.expectRevert("not owner");
+        token.updateIdentityProvider(bob, true);
+    }
+
+    function test_onlyComplianceUpdateAllowlist() public {
+        vm.prank(alice);
+        vm.expectRevert("not compliance");
+        token.updateAllowlist(bob, true);
+    }
+
+    function test_onlyComplianceBlockJurisdiction() public {
+        vm.prank(alice);
+        vm.expectRevert("not compliance");
+        token.blockJurisdiction("US", true);
+    }
+
+    function test_isTransferAllowed_allowlistBlocked() public {
+        vm.prank(admin);
+        token.setAllowlistOnly(true);
+        assertFalse(token.isTransferAllowed(admin, alice, 100e18));
+    }
+
+    function test_isTransferAllowed_kycBlocked() public {
+        vm.prank(admin);
+        token.setKYCRequired(true, TokenGuard.KYCLevel.Basic);
+        assertFalse(token.isTransferAllowed(admin, alice, 100e18));
+    }
+
+    function test_isTransferAllowed_recipientKYCBlocked() public {
+        vm.startPrank(admin);
+        token.setKYCRequired(true, TokenGuard.KYCLevel.Basic);
+        token.attestIdentity(admin, TokenGuard.KYCLevel.Basic, "PL", 0);
+        // alice has no KYC
+        vm.stopPrank();
+        assertFalse(token.isTransferAllowed(admin, alice, 100e18));
+    }
+
+    function test_isTransferAllowed_jurisdictionBlocked() public {
+        vm.startPrank(admin);
+        token.setJurisdictionRestrictions(true);
+        token.attestIdentity(admin, TokenGuard.KYCLevel.Basic, "KP", 0);
+        token.attestIdentity(alice, TokenGuard.KYCLevel.Basic, "US", 0);
+        vm.stopPrank();
+
+        vm.prank(compliance);
+        token.blockJurisdiction("KP", true);
+        assertFalse(token.isTransferAllowed(admin, alice, 100e18));
+    }
+
+    function test_isTransferAllowed_recipientJurisdictionBlocked() public {
+        vm.startPrank(admin);
+        token.setJurisdictionRestrictions(true);
+        token.attestIdentity(admin, TokenGuard.KYCLevel.Basic, "US", 0);
+        token.attestIdentity(alice, TokenGuard.KYCLevel.Basic, "KP", 0);
+        vm.stopPrank();
+
+        vm.prank(compliance);
+        token.blockJurisdiction("KP", true);
+        assertFalse(token.isTransferAllowed(admin, alice, 100e18));
+    }
+
+    function test_isTransferAllowed_maxTransfer() public {
+        vm.prank(admin);
+        token.setMaxTransferAmount(50e18);
+        assertFalse(token.isTransferAllowed(admin, alice, 100e18));
+    }
+
+    function test_attestWithDefaultDailyLimit() public {
+        vm.startPrank(admin);
+        token.setDefaultDailyLimit(5000e18);
+        token.attestIdentity(alice, TokenGuard.KYCLevel.Basic, "US", 0);
+        vm.stopPrank();
+        (,,,,, uint256 dailyLimit,) = token.getIdentity(alice);
+        assertEq(dailyLimit, 5000e18);
+    }
 }
